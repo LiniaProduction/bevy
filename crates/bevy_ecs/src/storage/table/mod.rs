@@ -562,6 +562,56 @@ impl Table {
         self.columns.values()
     }
 
+    /// Releases the spare capacity this table is holding beyond the rows it
+    /// actually stores.
+    ///
+    /// A table only ever grows: [`Table::reserve`] doubles through
+    /// [`Vec::reserve`] and nothing ever gives the room back. That is the right
+    /// default for a table an application keeps filling, and the wrong one for a
+    /// table an application passes *through* — every archetype move leaves the
+    /// source table sized for every row that has ever lived in it, and a table
+    /// with no entities left still owns all of its columns. On a document editor
+    /// that spawns entities and then adds components to them, this is the
+    /// dominant memory cost: measured on one 32k-entity scene, 303 MB of table
+    /// capacity backed 46 MB of live component data, and 231 MB of that sat in
+    /// archetypes that no longer held a single entity.
+    ///
+    /// Rows are not moved, so every [`TableRow`] stays valid; only the unused
+    /// tail is released. The floor is one row rather than zero, which keeps the
+    /// columns allocated and lets [`Table::reserve`] stay on its `realloc` path
+    /// instead of having to tell an emptied table from a fresh one.
+    pub fn shrink_to_fit(&mut self) {
+        let current_capacity = self.entities.capacity();
+        if current_capacity == 0 {
+            return;
+        }
+
+        // The columns take their capacity from this vector, so it has to move
+        // first and then say what it settled on: `Vec` is free to keep more than
+        // it was asked for, and a column reallocated to a different number than
+        // the vector holds would break the invariant `reserve` relies on.
+        self.entities.shrink_to(1);
+        let new_capacity = self.entities.capacity();
+        debug_assert!(new_capacity > 0);
+        if new_capacity >= current_capacity {
+            return;
+        }
+
+        // SAFETY:
+        // - `current_capacity` is the columns' capacity: it was read from the
+        //   entities vector before it was shrunk, and the two are kept equal.
+        // - Both capacities are non-zero: the early return covers the source,
+        //   and `shrink_to(1)` guarantees the target.
+        // - `new_capacity` is at least `entity_count`, so no initialised element
+        //   falls outside the new allocation.
+        unsafe {
+            self.realloc_columns(
+                NonZeroUsize::new_unchecked(current_capacity),
+                NonZeroUsize::new_unchecked(new_capacity),
+            );
+        }
+    }
+
     /// Clears all of the stored components in the [`Table`].
     ///
     /// # Panics
@@ -706,6 +756,15 @@ impl Tables {
     /// Iterates through all of the tables stored within in [`TableId`] order.
     pub fn iter(&self) -> core::slice::Iter<'_, Table> {
         self.tables.iter()
+    }
+
+    /// Releases the spare capacity every table is holding.
+    ///
+    /// See [`Table::shrink_to_fit`] for what is released and why it accumulates.
+    pub fn shrink_to_fit(&mut self) {
+        for table in &mut self.tables {
+            table.shrink_to_fit();
+        }
     }
 
     /// Clears all data from all [`Table`]s stored within.
@@ -912,5 +971,181 @@ mod tests {
 
         assert_eq!(table.entity_capacity(), 256);
         assert_eq!(table.entity_count(), 200);
+    }
+
+    /// Growing then shrinking must hand the tail back while leaving every stored
+    /// row readable at the same [`TableRow`].
+    #[test]
+    fn shrink_to_fit_releases_the_tail_and_keeps_the_rows() {
+        let mut components = Components::default();
+        let mut componentids = ComponentIds::default();
+        // SAFETY: They are both new so they are compatible.
+        let mut registrator =
+            unsafe { ComponentsRegistrator::new(&mut components, &mut componentids) };
+        let component_id = registrator.register_component::<W<TableRow>>();
+        let columns = &[component_id];
+        let mut table = TableBuilder::with_capacity(0, columns.len())
+            .add_column(components.get_info(component_id).unwrap())
+            .build();
+
+        let entities = (0..200)
+            .map(|index| Entity::from_index(EntityIndex::from_raw_u32(index).unwrap()))
+            .collect::<Vec<_>>();
+        for entity in &entities {
+            // SAFETY: we allocate and immediately set data afterwards
+            unsafe {
+                let row = table.allocate(*entity);
+                let value: W<TableRow> = W(row);
+                OwningPtr::make(value, |value_ptr| {
+                    table.get_column_mut(component_id).unwrap().initialize(
+                        row,
+                        value_ptr,
+                        Tick::new(0),
+                        MaybeLocation::caller(),
+                    );
+                });
+            };
+        }
+        assert_eq!(table.entity_capacity(), 256);
+
+        table.shrink_to_fit();
+
+        assert_eq!(table.entity_count(), 200);
+        assert!(
+            table.entity_capacity() < 256,
+            "the spare tail should have been released, capacity is {}",
+            table.entity_capacity()
+        );
+        assert!(table.entity_capacity() >= 200);
+
+        for (index, entity) in entities.iter().enumerate() {
+            assert_eq!(table.entities()[index], *entity);
+            let row = TableRow::new(nonmax::NonMaxU32::new(index as u32).unwrap());
+            // SAFETY: `row` is in bounds and the column holds `W<TableRow>`.
+            let stored = unsafe {
+                table
+                    .get_component(component_id, row)
+                    .unwrap()
+                    .deref::<W<TableRow>>()
+            };
+            assert_eq!(stored.0, row);
+        }
+    }
+
+    /// An emptied table keeps its columns allocated at one row, so the growth
+    /// path stays on `realloc` and refilling it still works.
+    #[test]
+    fn an_emptied_table_shrinks_to_one_row_and_can_grow_again() {
+        let mut components = Components::default();
+        let mut componentids = ComponentIds::default();
+        // SAFETY: They are both new so they are compatible.
+        let mut registrator =
+            unsafe { ComponentsRegistrator::new(&mut components, &mut componentids) };
+        let component_id = registrator.register_component::<W<TableRow>>();
+        let columns = &[component_id];
+        let mut table = TableBuilder::with_capacity(0, columns.len())
+            .add_column(components.get_info(component_id).unwrap())
+            .build();
+
+        for index in 0..200 {
+            let entity = Entity::from_index(EntityIndex::from_raw_u32(index).unwrap());
+            // SAFETY: we allocate and immediately set data afterwards
+            unsafe {
+                let row = table.allocate(entity);
+                let value: W<TableRow> = W(row);
+                OwningPtr::make(value, |value_ptr| {
+                    table.get_column_mut(component_id).unwrap().initialize(
+                        row,
+                        value_ptr,
+                        Tick::new(0),
+                        MaybeLocation::caller(),
+                    );
+                });
+            };
+        }
+        for index in (0..200u32).rev() {
+            // SAFETY: `index` is the last row every time.
+            unsafe { table.swap_remove_unchecked(TableRow::new(nonmax::NonMaxU32::new(index).unwrap())) };
+        }
+        assert_eq!(table.entity_count(), 0);
+
+        table.shrink_to_fit();
+        assert_eq!(table.entity_capacity(), 1);
+
+        let entity = Entity::from_index(EntityIndex::from_raw_u32(7).unwrap());
+        // SAFETY: we allocate and immediately set data afterwards
+        unsafe {
+            let row = table.allocate(entity);
+            let value: W<TableRow> = W(row);
+            OwningPtr::make(value, |value_ptr| {
+                table.get_column_mut(component_id).unwrap().initialize(
+                    row,
+                    value_ptr,
+                    Tick::new(0),
+                    MaybeLocation::caller(),
+                );
+            });
+        };
+        assert_eq!(table.entity_count(), 1);
+        assert_eq!(table.entities()[0], entity);
+    }
+
+    /// Shrinking twice must be a no-op the second time rather than reallocating
+    /// against a capacity the columns no longer have.
+    #[test]
+    fn shrink_to_fit_is_idempotent() {
+        let mut components = Components::default();
+        let mut componentids = ComponentIds::default();
+        // SAFETY: They are both new so they are compatible.
+        let mut registrator =
+            unsafe { ComponentsRegistrator::new(&mut components, &mut componentids) };
+        let component_id = registrator.register_component::<W<TableRow>>();
+        let columns = &[component_id];
+        let mut table = TableBuilder::with_capacity(0, columns.len())
+            .add_column(components.get_info(component_id).unwrap())
+            .build();
+
+        for index in 0..10 {
+            let entity = Entity::from_index(EntityIndex::from_raw_u32(index).unwrap());
+            // SAFETY: we allocate and immediately set data afterwards
+            unsafe {
+                let row = table.allocate(entity);
+                let value: W<TableRow> = W(row);
+                OwningPtr::make(value, |value_ptr| {
+                    table.get_column_mut(component_id).unwrap().initialize(
+                        row,
+                        value_ptr,
+                        Tick::new(0),
+                        MaybeLocation::caller(),
+                    );
+                });
+            };
+        }
+
+        table.shrink_to_fit();
+        let settled = table.entity_capacity();
+        table.shrink_to_fit();
+        assert_eq!(table.entity_capacity(), settled);
+        assert_eq!(table.entity_count(), 10);
+    }
+
+    /// A table that never allocated must not be touched.
+    #[test]
+    fn shrinking_an_untouched_table_is_a_no_op() {
+        let mut components = Components::default();
+        let mut componentids = ComponentIds::default();
+        // SAFETY: They are both new so they are compatible.
+        let mut registrator =
+            unsafe { ComponentsRegistrator::new(&mut components, &mut componentids) };
+        let component_id = registrator.register_component::<W<TableRow>>();
+        let columns = &[component_id];
+        let mut table = TableBuilder::with_capacity(0, columns.len())
+            .add_column(components.get_info(component_id).unwrap())
+            .build();
+
+        assert_eq!(table.entity_capacity(), 0);
+        table.shrink_to_fit();
+        assert_eq!(table.entity_capacity(), 0);
+        assert_eq!(table.entity_count(), 0);
     }
 }

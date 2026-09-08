@@ -1737,6 +1737,25 @@ impl World {
         self.last_change_tick = self.increment_change_tick();
     }
 
+    /// Releases the table capacity this world is holding beyond the rows it
+    /// actually stores.
+    ///
+    /// Tables only grow. Adding a component moves an entity to a different
+    /// archetype, and the table it came from keeps room for every row that ever
+    /// passed through it, so an application that spawns entities and then fills
+    /// them in leaves a trail of full-size tables behind — including tables that
+    /// no longer hold a single entity. Nothing in the normal course of running a
+    /// schedule gives that memory back.
+    ///
+    /// This walks every table and drops the unused tail. Rows are not moved, so
+    /// every [`TableRow`](crate::storage::TableRow) and every archetype index
+    /// stays valid; the call only costs the reallocations themselves. It is
+    /// meant for the moments an application knows the shape of its data has
+    /// settled — after a load, or while idle — not for every frame.
+    pub fn shrink_tables(&mut self) {
+        self.storages.tables.shrink_to_fit();
+    }
+
     /// Returns [`QueryState`] for the given [`QueryData`], which is used to efficiently
     /// run queries on the [`World`] by storing and reusing the [`QueryState`].
     /// ```
