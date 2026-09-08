@@ -562,27 +562,55 @@ impl Table {
         self.columns.values()
     }
 
-    /// Releases the spare capacity this table is holding beyond the rows it
-    /// actually stores.
+    /// Rows of spare capacity a shrunk table keeps regardless of its size.
+    ///
+    /// Zero would be correct for a world that stops changing after it loads, and
+    /// wrong for one that does not: a table trimmed to exactly its length pays a
+    /// reallocation and a full copy on the very next entity that lands in it.
+    /// Eight rows is small enough to be noise next to a real table and enough to
+    /// absorb the handful of entities that arrive together — one node being
+    /// drawn, one paste, one undo.
+    const MIN_SPARE_ROWS: usize = 8;
+
+    /// Denominator of the proportional part of the spare capacity: `len / 8`,
+    /// so an eighth on top of what is stored.
+    ///
+    /// The floor alone does not scale: a table holding thirty thousand rows that
+    /// is trimmed to thirty thousand and eight copies all thirty thousand as
+    /// soon as nine more arrive. An eighth keeps the growth amortized while
+    /// giving back the multiple that matters — the measured overhang was more
+    /// than six times the live data, not one and an eighth.
+    const SPARE_FRACTION: usize = 8;
+
+    /// Releases the spare capacity this table is holding, keeping working room
+    /// for the rows that will arrive next.
     ///
     /// A table only ever grows: [`Table::reserve`] doubles through
     /// [`Vec::reserve`] and nothing ever gives the room back. That is the right
-    /// default for a table an application keeps filling, and the wrong one for a
-    /// table an application passes *through* — every archetype move leaves the
-    /// source table sized for every row that has ever lived in it, and a table
-    /// with no entities left still owns all of its columns. On a document editor
-    /// that spawns entities and then adds components to them, this is the
-    /// dominant memory cost: measured on one 32k-entity scene, 303 MB of table
-    /// capacity backed 46 MB of live component data, and 231 MB of that sat in
-    /// archetypes that no longer held a single entity.
+    /// default for a game that builds a scene and then runs it, and the wrong
+    /// one for an editor that keeps creating entities — every archetype move
+    /// leaves the source table sized for every row that has ever lived in it,
+    /// and a table with no entities left still owns all of its columns. On one
+    /// 32k-entity document, 303 MB of table capacity backed 46 MB of live
+    /// component data, and 231 MB of that sat in archetypes that no longer held
+    /// a single entity.
     ///
-    /// Rows are not moved, so every [`TableRow`] stays valid; only the unused
-    /// tail is released. The floor is one row rather than zero, which keeps the
-    /// columns allocated and lets [`Table::reserve`] stay on its `realloc` path
-    /// instead of having to tell an emptied table from a fresh one.
+    /// What is kept is [`Table::MIN_SPARE_ROWS`] or an eighth of the length,
+    /// whichever is larger, so the next spawn does not immediately pay for a
+    /// reallocation. Rows are not moved, so every [`TableRow`] stays valid; only
+    /// the unused tail beyond that headroom is released. A table that has never
+    /// allocated is left alone, and a table that is already at or under its
+    /// target keeps what it has — this never grows a table.
     pub fn shrink_to_fit(&mut self) {
         let current_capacity = self.entities.capacity();
         if current_capacity == 0 {
+            return;
+        }
+
+        let len = self.entities.len();
+        let spare = (len / Self::SPARE_FRACTION).max(Self::MIN_SPARE_ROWS);
+        let target = len.saturating_add(spare);
+        if target >= current_capacity {
             return;
         }
 
@@ -590,20 +618,21 @@ impl Table {
         // first and then say what it settled on: `Vec` is free to keep more than
         // it was asked for, and a column reallocated to a different number than
         // the vector holds would break the invariant `reserve` relies on.
-        self.entities.shrink_to(1);
+        self.entities.shrink_to(target);
         let new_capacity = self.entities.capacity();
-        debug_assert!(new_capacity > 0);
+        debug_assert!(new_capacity >= len);
         if new_capacity >= current_capacity {
             return;
         }
+        debug_assert!(new_capacity > 0);
 
         // SAFETY:
         // - `current_capacity` is the columns' capacity: it was read from the
         //   entities vector before it was shrunk, and the two are kept equal.
         // - Both capacities are non-zero: the early return covers the source,
-        //   and `shrink_to(1)` guarantees the target.
-        // - `new_capacity` is at least `entity_count`, so no initialised element
-        //   falls outside the new allocation.
+        //   and the target is at least `MIN_SPARE_ROWS`.
+        // - `new_capacity` is at least `len`, so no initialised element falls
+        //   outside the new allocation.
         unsafe {
             self.realloc_columns(
                 NonZeroUsize::new_unchecked(current_capacity),
@@ -1016,7 +1045,8 @@ mod tests {
             "the spare tail should have been released, capacity is {}",
             table.entity_capacity()
         );
-        assert!(table.entity_capacity() >= 200);
+        // 200 rows plus an eighth of them.
+        assert!(table.entity_capacity() >= 225);
 
         for (index, entity) in entities.iter().enumerate() {
             assert_eq!(table.entities()[index], *entity);
@@ -1032,10 +1062,10 @@ mod tests {
         }
     }
 
-    /// An emptied table keeps its columns allocated at one row, so the growth
+    /// An emptied table keeps its columns allocated at the floor, so the growth
     /// path stays on `realloc` and refilling it still works.
     #[test]
-    fn an_emptied_table_shrinks_to_one_row_and_can_grow_again() {
+    fn an_emptied_table_keeps_the_floor_and_can_grow_again() {
         let mut components = Components::default();
         let mut componentids = ComponentIds::default();
         // SAFETY: They are both new so they are compatible.
@@ -1070,7 +1100,7 @@ mod tests {
         assert_eq!(table.entity_count(), 0);
 
         table.shrink_to_fit();
-        assert_eq!(table.entity_capacity(), 1);
+        assert_eq!(table.entity_capacity(), super::Table::MIN_SPARE_ROWS);
 
         let entity = Entity::from_index(EntityIndex::from_raw_u32(7).unwrap());
         // SAFETY: we allocate and immediately set data afterwards
@@ -1127,6 +1157,68 @@ mod tests {
         table.shrink_to_fit();
         assert_eq!(table.entity_capacity(), settled);
         assert_eq!(table.entity_count(), 10);
+    }
+
+    /// The point of the headroom: after shrinking, the rows that arrive next fit
+    /// without the table having to reallocate.
+    #[test]
+    fn the_headroom_absorbs_the_next_arrivals() {
+        let mut components = Components::default();
+        let mut componentids = ComponentIds::default();
+        // SAFETY: They are both new so they are compatible.
+        let mut registrator =
+            unsafe { ComponentsRegistrator::new(&mut components, &mut componentids) };
+        let component_id = registrator.register_component::<W<TableRow>>();
+        let columns = &[component_id];
+        let mut table = TableBuilder::with_capacity(0, columns.len())
+            .add_column(components.get_info(component_id).unwrap())
+            .build();
+
+        for index in 0..200 {
+            let entity = Entity::from_index(EntityIndex::from_raw_u32(index).unwrap());
+            // SAFETY: we allocate and immediately set data afterwards
+            unsafe {
+                let row = table.allocate(entity);
+                let value: W<TableRow> = W(row);
+                OwningPtr::make(value, |value_ptr| {
+                    table.get_column_mut(component_id).unwrap().initialize(
+                        row,
+                        value_ptr,
+                        Tick::new(0),
+                        MaybeLocation::caller(),
+                    );
+                });
+            };
+        }
+
+        table.shrink_to_fit();
+        let settled = table.entity_capacity();
+        assert!(settled >= 225);
+
+        // An eighth of two hundred is twenty five; the first of those must not
+        // cost a reallocation, and neither must the twenty fifth.
+        for index in 200..225u32 {
+            let entity = Entity::from_index(EntityIndex::from_raw_u32(index).unwrap());
+            // SAFETY: we allocate and immediately set data afterwards
+            unsafe {
+                let row = table.allocate(entity);
+                let value: W<TableRow> = W(row);
+                OwningPtr::make(value, |value_ptr| {
+                    table.get_column_mut(component_id).unwrap().initialize(
+                        row,
+                        value_ptr,
+                        Tick::new(0),
+                        MaybeLocation::caller(),
+                    );
+                });
+            };
+        }
+        assert_eq!(table.entity_count(), 225);
+        assert_eq!(
+            table.entity_capacity(),
+            settled,
+            "the headroom should have absorbed these rows without reallocating"
+        );
     }
 
     /// A table that never allocated must not be touched.
