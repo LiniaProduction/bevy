@@ -680,10 +680,13 @@ impl Table {
     /// Zero would be correct for a world that stops changing after it loads, and
     /// wrong for one that does not: a table trimmed to exactly its length pays a
     /// reallocation and a full copy on the very next entity that lands in it.
-    /// Eight rows is small enough to be noise next to a real table and enough to
-    /// absorb the handful of entities that arrive together — one node being
-    /// drawn, one paste, one undo.
-    const MIN_SPARE_ROWS: usize = 8;
+    /// Four rows is small enough to be noise next to a real table and enough to
+    /// absorb the entities that arrive together at the start — one node being
+    /// drawn, one paste. Past that the proportional part takes over, and a table
+    /// that is empty right now grows back through `reserve`'s doubling, which is
+    /// amortized anyway; paying more floor for every dead archetype in the world
+    /// costs more than it saves.
+    const MIN_SPARE_ROWS: usize = 4;
 
     /// Denominator of the proportional part of the spare capacity: `len / 8`,
     /// so an eighth on top of what is stored.
