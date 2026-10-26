@@ -1616,8 +1616,15 @@ impl World {
     /// stays valid; the call only costs the reallocations themselves. It is
     /// meant for the moments an application knows the shape of its data has
     /// settled — after a load, or while idle — not for every frame.
+    ///
+    /// The same goes for the archetypes those entities passed through: their
+    /// entity lists are trimmed alongside the tables and their cached
+    /// transitions are dropped, see [`Archetype::shrink_to_fit`].
+    ///
+    /// [`Archetype::shrink_to_fit`]: crate::archetype::Archetype
     pub fn shrink_tables(&mut self) {
         self.storages.tables.shrink_to_fit();
+        self.archetypes.shrink_to_fit();
     }
 
     /// Returns [`QueryState`] for the given [`QueryData`], which is used to efficiently

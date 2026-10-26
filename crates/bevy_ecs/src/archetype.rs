@@ -26,7 +26,7 @@ use crate::{
     event::Event,
     observer::Observers,
     query::DebugCheckedUnwrap,
-    storage::{ImmutableSparseSet, SparseArray, SparseSet, TableId, TableRow},
+    storage::{ImmutableSparseSet, SparseArray, SparseSet, Table, TableId, TableRow},
 };
 use alloc::{boxed::Box, vec::Vec};
 use bevy_platform::collections::{hash_map::Entry, HashMap};
@@ -470,6 +470,28 @@ impl Archetype {
         self.table_id
     }
 
+    /// Releases the bookkeeping this archetype keeps beyond the entities it
+    /// holds right now.
+    ///
+    /// The entity list grows like a table and never gives room back, so an
+    /// archetype every entity passed through on its way somewhere else keeps a
+    /// slot for each of them. The edges remember where each bundle insert or
+    /// removal leads; most of them were taken once, while a document was being
+    /// filled in, and are dropped here — the next move through an edge looks the
+    /// target up again and caches it. The headroom left in the entity list
+    /// follows [`Table::shrink_to_fit`](crate::storage::Table::shrink_to_fit).
+    pub(crate) fn shrink_to_fit(&mut self) {
+        let len = self.entities.len();
+        let spare = (len / Table::SPARE_FRACTION).max(Table::MIN_SPARE_ROWS);
+        self.entities.shrink_to(len.saturating_add(spare));
+        self.edges = Edges::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entity_capacity(&self) -> usize {
+        self.entities.capacity()
+    }
+
     /// Fetches the entities contained in this archetype.
     #[inline]
     pub fn entities(&self) -> &[ArchetypeEntity] {
@@ -809,6 +831,13 @@ impl Archetypes {
         archetypes
     }
 
+    /// Runs [`Archetype::shrink_to_fit`] on every archetype.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        for archetype in &mut self.archetypes {
+            archetype.shrink_to_fit();
+        }
+    }
+
     /// Returns the "generation", a handle to the current highest archetype ID.
     ///
     /// This can be used with the `Index` [`Archetypes`] implementation to
@@ -981,5 +1010,84 @@ impl IndexMut<ArchetypeId> for Archetypes {
     #[inline]
     fn index_mut(&mut self, index: ArchetypeId) -> &mut Self::Output {
         &mut self.archetypes[index.index()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{component::Component, entity::Entity, storage::Table, world::World};
+    use alloc::vec::Vec;
+
+    #[derive(Component)]
+    struct Base(u32);
+
+    #[derive(Component)]
+    struct Extra;
+
+    #[derive(Component)]
+    #[component(storage = "SparseSet")]
+    struct Marker;
+
+    #[test]
+    fn shrinking_trims_an_archetype_every_entity_has_left() {
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..1000).map(|i| world.spawn(Base(i)).id()).collect();
+        let passed = world.entity(entities[0]).archetype().id();
+        for &entity in &entities {
+            world.entity_mut(entity).insert(Extra);
+        }
+        assert!(world.archetypes()[passed].entity_capacity() >= 1000);
+
+        world.shrink_tables();
+
+        assert!(world.archetypes()[passed].is_empty());
+        assert!(world.archetypes()[passed].entity_capacity() <= 2 * Table::MIN_SPARE_ROWS);
+    }
+
+    #[test]
+    fn shrinking_keeps_headroom_for_the_entities_still_there() {
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..1000).map(|i| world.spawn(Base(i)).id()).collect();
+        for &entity in &entities[100..] {
+            world.entity_mut(entity).insert(Extra);
+        }
+        let kept = world.entity(entities[0]).archetype().id();
+
+        world.shrink_tables();
+
+        let capacity = world.archetypes()[kept].entity_capacity();
+        assert_eq!(world.archetypes()[kept].len(), 100);
+        assert!((100 + Table::MIN_SPARE_ROWS..1000).contains(&capacity));
+    }
+
+    #[test]
+    fn moves_after_a_shrink_find_the_same_archetypes() {
+        let mut world = World::new();
+        let path = |world: &mut World| {
+            let entity = world.spawn(Base(1)).id();
+            let mut ids = Vec::new();
+            ids.push(world.entity(entity).archetype().id());
+            world.entity_mut(entity).insert(Extra);
+            ids.push(world.entity(entity).archetype().id());
+            world.entity_mut(entity).insert(Marker);
+            ids.push(world.entity(entity).archetype().id());
+            world.entity_mut(entity).remove::<Extra>();
+            ids.push(world.entity(entity).archetype().id());
+            let _ = world.entity_mut(entity).take::<Marker>();
+            ids.push(world.entity(entity).archetype().id());
+            (entity, ids)
+        };
+        let (first, before) = path(&mut world);
+        let archetypes = world.archetypes().len();
+
+        world.shrink_tables();
+        let (second, after) = path(&mut world);
+
+        assert_eq!(before, after);
+        assert_eq!(world.archetypes().len(), archetypes);
+        assert_eq!(world.get::<Base>(first).unwrap().0, 1);
+        assert_eq!(world.get::<Base>(second).unwrap().0, 1);
+        assert!(world.get::<Extra>(second).is_none());
+        assert!(world.get::<Marker>(second).is_none());
     }
 }

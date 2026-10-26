@@ -686,7 +686,7 @@ impl Table {
     /// that is empty right now grows back through `reserve`'s doubling, which is
     /// amortized anyway; paying more floor for every dead archetype in the world
     /// costs more than it saves.
-    const MIN_SPARE_ROWS: usize = 4;
+    pub(crate) const MIN_SPARE_ROWS: usize = 4;
 
     /// Denominator of the proportional part of the spare capacity: `len / 8`,
     /// so an eighth on top of what is stored.
@@ -696,7 +696,7 @@ impl Table {
     /// soon as nine more arrive. An eighth keeps the growth amortized while
     /// giving back the multiple that matters — the measured overhang was more
     /// than six times the live data, not one and an eighth.
-    const SPARE_FRACTION: usize = 8;
+    pub(crate) const SPARE_FRACTION: usize = 8;
 
     /// Releases the spare capacity this table is holding, keeping working room
     /// for the rows that will arrive next.
